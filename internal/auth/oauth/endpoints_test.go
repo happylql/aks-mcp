@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -23,7 +24,11 @@ func createTestConfig() *config.ConfigData {
 		TenantID:       "test-tenant",
 		ClientID:       "test-client",
 		RequiredScopes: []string{"https://management.azure.com/.default"},
-		RedirectURIs:   []string{"http://127.0.0.1:8000/oauth/callback", "http://localhost:8000/oauth/callback"},
+		RedirectURIs: []string{
+			"http://127.0.0.1:8000/oauth/callback",
+			"http://localhost:8000/oauth/callback",
+			"https://example-mcp-client.com/callback",
+		},
 		TokenValidation: auth.TokenValidationConfig{
 			ValidateJWT:      false,
 			ValidateAudience: false,
@@ -52,7 +57,7 @@ func TestEndpointManager_RegisterEndpoints(t *testing.T) {
 		{"GET", "/.well-known/oauth-authorization-server", http.StatusInternalServerError}, // Will fail without real Azure AD
 		{"POST", "/oauth/register", http.StatusBadRequest},                                 // Missing required data
 		{"POST", "/oauth/introspect", http.StatusBadRequest},                               // Missing token param
-		{"GET", "/oauth/callback", http.StatusBadRequest},                                  // Missing required params
+		{"GET", "/oauth/callback", http.StatusBadRequest},                                  // No state → invalid or expired state
 	}
 
 	for _, tc := range testCases {
@@ -268,7 +273,9 @@ func TestCallbackEndpointMissingCode(t *testing.T) {
 	provider, _ := NewAzureOAuthProvider(cfg.OAuthConfig)
 	manager := NewEndpointManager(provider, cfg)
 
-	// Test callback without authorization code
+	// Pre-seed state so the handler can look up the redirect_uri.
+	manager.pendingStates["test-state"] = "https://example-mcp-client.com/callback"
+
 	req := httptest.NewRequest("GET", "/oauth/callback?state=test-state", nil)
 	w := httptest.NewRecorder()
 
@@ -279,15 +286,9 @@ func TestCallbackEndpointMissingCode(t *testing.T) {
 		t.Errorf("Expected status 400 for missing code, got %d", w.Code)
 	}
 
-	// Check that response contains HTML error page
-	contentType := w.Header().Get("Content-Type")
-	if !strings.Contains(contentType, "text/html") {
-		t.Errorf("Expected HTML content type, got %s", contentType)
-	}
-
 	body := w.Body.String()
-	if !strings.Contains(body, "Missing authorization code") {
-		t.Error("Expected error message about missing authorization code")
+	if !strings.Contains(body, "missing code parameter") {
+		t.Errorf("Expected error message about missing code, got: %s", body)
 	}
 }
 
@@ -297,7 +298,7 @@ func TestCallbackEndpointMissingState(t *testing.T) {
 	provider, _ := NewAzureOAuthProvider(cfg.OAuthConfig)
 	manager := NewEndpointManager(provider, cfg)
 
-	// Test callback without state parameter
+	// No state → no pending state entry → 400.
 	req := httptest.NewRequest("GET", "/oauth/callback?code=test-code", nil)
 	w := httptest.NewRecorder()
 
@@ -309,8 +310,8 @@ func TestCallbackEndpointMissingState(t *testing.T) {
 	}
 
 	body := w.Body.String()
-	if !strings.Contains(body, "Missing state parameter") {
-		t.Error("Expected error message about missing state parameter")
+	if !strings.Contains(body, "invalid or expired state") {
+		t.Errorf("Expected invalid state error, got: %s", body)
 	}
 }
 
@@ -320,23 +321,90 @@ func TestCallbackEndpointAuthError(t *testing.T) {
 	provider, _ := NewAzureOAuthProvider(cfg.OAuthConfig)
 	manager := NewEndpointManager(provider, cfg)
 
-	// Test callback with authorization error
-	req := httptest.NewRequest("GET", "/oauth/callback?error=access_denied&error_description=User%20denied%20access", nil)
+	// Pre-seed state so the error can be relayed to the client redirect_uri.
+	manager.pendingStates["test-state"] = "https://example-mcp-client.com/callback"
+
+	req := httptest.NewRequest("GET", "/oauth/callback?error=access_denied&error_description=User%20denied%20access&state=test-state", nil)
+	w := httptest.NewRecorder()
+
+	handler := manager.callbackHandler()
+	handler(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Errorf("Expected status 302 for auth error relay, got %d", w.Code)
+	}
+
+	location := w.Header().Get("Location")
+	if !strings.Contains(location, "https://example-mcp-client.com/callback") {
+		t.Errorf("Expected redirect to client URI, got: %s", location)
+	}
+	if !strings.Contains(location, "error=access_denied") {
+		t.Errorf("Expected error param in redirect, got: %s", location)
+	}
+	if !strings.Contains(location, "state=test-state") {
+		t.Errorf("Expected state param in redirect, got: %s", location)
+	}
+}
+
+func TestCallbackEndpointUnknownState(t *testing.T) {
+	cfg := createTestConfig()
+
+	provider, _ := NewAzureOAuthProvider(cfg.OAuthConfig)
+	manager := NewEndpointManager(provider, cfg)
+
+	// No pending state seeded → unknown/expired state.
+	req := httptest.NewRequest("GET", "/oauth/callback?code=test-code&state=unknown-state", nil)
 	w := httptest.NewRecorder()
 
 	handler := manager.callbackHandler()
 	handler(w, req)
 
 	if w.Code != http.StatusBadRequest {
-		t.Errorf("Expected status 400 for auth error, got %d", w.Code)
+		t.Errorf("Expected status 400 for unknown state, got %d", w.Code)
 	}
 
 	body := w.Body.String()
-	if !strings.Contains(body, "Authorization failed") {
-		t.Error("Expected error message about authorization failure")
+	if !strings.Contains(body, "invalid or expired state") {
+		t.Errorf("Expected invalid state error, got: %s", body)
 	}
-	if !strings.Contains(body, "access_denied") {
-		t.Error("Expected specific error code in response")
+}
+
+func TestCallbackEndpointValidCodeRelayed(t *testing.T) {
+	cfg := createTestConfig()
+
+	provider, _ := NewAzureOAuthProvider(cfg.OAuthConfig)
+	manager := NewEndpointManager(provider, cfg)
+
+	// Pre-seed state as the authorize handler would.
+	manager.pendingStates["my-state"] = "https://example-mcp-client.com/callback"
+
+	req := httptest.NewRequest("GET", "/oauth/callback?code=authcode123&state=my-state", nil)
+	w := httptest.NewRecorder()
+
+	handler := manager.callbackHandler()
+	handler(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Errorf("Expected status 302, got %d", w.Code)
+	}
+
+	location := w.Header().Get("Location")
+	if !strings.Contains(location, "https://example-mcp-client.com/callback") {
+		t.Errorf("Expected redirect to client URI, got: %s", location)
+	}
+	if !strings.Contains(location, "code=authcode123") {
+		t.Errorf("Expected code param preserved in redirect, got: %s", location)
+	}
+	if !strings.Contains(location, "state=my-state") {
+		t.Errorf("Expected state param preserved in redirect, got: %s", location)
+	}
+
+	// State must be consumed — a second callback with the same state should fail.
+	req2 := httptest.NewRequest("GET", "/oauth/callback?code=authcode123&state=my-state", nil)
+	w2 := httptest.NewRecorder()
+	handler(w2, req2)
+	if w2.Code != http.StatusBadRequest {
+		t.Errorf("Expected 400 on replayed state, got %d", w2.Code)
 	}
 }
 
@@ -555,6 +623,75 @@ func TestProtectedResourceMetadataEndpointTransportPaths(t *testing.T) {
 	}
 }
 
+func TestProtectedResourceMetadataEndpointExternalURL(t *testing.T) {
+	tests := []struct {
+		name                string
+		externalURL         string
+		transport           string
+		expectedResourceURL string
+		// r.TLS is nil and Host is empty — without ExternalURL this would produce http://example.com
+	}{
+		{
+			name:                "externalURL overrides scheme and host for streamable-http",
+			externalURL:         "https://aks-mcp.platform.example.com",
+			transport:           "streamable-http",
+			expectedResourceURL: "https://aks-mcp.platform.example.com/mcp",
+		},
+		{
+			name:                "externalURL overrides scheme and host for sse",
+			externalURL:         "https://aks-mcp.platform.example.com",
+			transport:           "sse",
+			expectedResourceURL: "https://aks-mcp.platform.example.com/sse",
+		},
+		{
+			name:                "externalURL with no transport path",
+			externalURL:         "https://aks-mcp.platform.example.com",
+			transport:           "",
+			expectedResourceURL: "https://aks-mcp.platform.example.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := createTestConfig()
+			cfg.Transport = tt.transport
+			cfg.OAuthConfig.ExternalURL = tt.externalURL
+
+			provider, _ := NewAzureOAuthProvider(cfg.OAuthConfig)
+			manager := NewEndpointManager(provider, cfg)
+
+			// Request has no TLS and no meaningful Host — ExternalURL must take precedence
+			req := httptest.NewRequest("GET", "/.well-known/oauth-protected-resource", nil)
+			req.Host = ""
+
+			w := httptest.NewRecorder()
+			handler := manager.protectedResourceMetadataHandler()
+			handler(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Errorf("Expected status 200, got %d", w.Code)
+			}
+
+			var metadata ProtectedResourceMetadata
+			if err := json.Unmarshal(w.Body.Bytes(), &metadata); err != nil {
+				t.Fatalf("Failed to parse response: %v", err)
+			}
+
+			if metadata.Resource != tt.expectedResourceURL {
+				t.Errorf("Expected resource URL %s, got %s", tt.expectedResourceURL, metadata.Resource)
+			}
+
+			// Authorization server URL should use ExternalURL as base (not http://)
+			if len(metadata.AuthorizationServers) != 1 {
+				t.Fatalf("Expected 1 authorization server, got %d", len(metadata.AuthorizationServers))
+			}
+			if !strings.HasPrefix(metadata.AuthorizationServers[0], "https://") {
+				t.Errorf("Expected authorization server URL to use https://, got %s", metadata.AuthorizationServers[0])
+			}
+		})
+	}
+}
+
 func TestProtectedResourceMetadataEndpointHostHeaders(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -695,6 +832,111 @@ func TestAuthorizationProxyRedirectURIValidation(t *testing.T) {
 				if !strings.Contains(location, "login.microsoftonline.com") {
 					t.Errorf("Expected redirect to Azure AD, got: %s", location)
 				}
+			}
+		})
+	}
+}
+
+func TestTokenHandlerValidation(t *testing.T) {
+	cfg := createTestConfig()
+	provider, _ := NewAzureOAuthProvider(cfg.OAuthConfig)
+	manager := NewEndpointManager(provider, cfg)
+	handler := manager.tokenHandler()
+
+	tests := []struct {
+		name       string
+		formValues map[string]string
+		expectCode int
+		expectErr  string
+	}{
+		{
+			name: "missing code",
+			formValues: map[string]string{
+				"grant_type":    "authorization_code",
+				"client_id":     "test-client",
+				"redirect_uri":  "http://127.0.0.1:8000/oauth/callback",
+				"code_verifier": "verifier",
+			},
+			expectCode: http.StatusBadRequest,
+			expectErr:  "authorization code",
+		},
+		{
+			name: "missing client_id",
+			formValues: map[string]string{
+				"grant_type":    "authorization_code",
+				"code":          "test-code",
+				"redirect_uri":  "http://127.0.0.1:8000/oauth/callback",
+				"code_verifier": "verifier",
+			},
+			expectCode: http.StatusBadRequest,
+			expectErr:  "client_id",
+		},
+		{
+			name: "missing redirect_uri",
+			formValues: map[string]string{
+				"grant_type":    "authorization_code",
+				"code":          "test-code",
+				"client_id":     "test-client",
+				"code_verifier": "verifier",
+			},
+			expectCode: http.StatusBadRequest,
+			expectErr:  "redirect_uri",
+		},
+		{
+			name: "missing code_verifier",
+			formValues: map[string]string{
+				"grant_type":   "authorization_code",
+				"code":         "test-code",
+				"client_id":    "test-client",
+				"redirect_uri": "http://127.0.0.1:8000/oauth/callback",
+			},
+			expectCode: http.StatusBadRequest,
+			expectErr:  "code_verifier",
+		},
+		{
+			name: "invalid redirect_uri",
+			formValues: map[string]string{
+				"grant_type":    "authorization_code",
+				"code":          "test-code",
+				"client_id":     "test-client",
+				"redirect_uri":  "http://malicious.com/callback",
+				"code_verifier": "verifier",
+			},
+			expectCode: http.StatusBadRequest,
+			expectErr:  "redirect_uri",
+		},
+		{
+			name: "unsupported grant type",
+			formValues: map[string]string{
+				"grant_type":    "client_credentials",
+				"code":          "test-code",
+				"client_id":     "test-client",
+				"redirect_uri":  "http://127.0.0.1:8000/oauth/callback",
+				"code_verifier": "verifier",
+			},
+			expectCode: http.StatusBadRequest,
+			expectErr:  "grant",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vals := url.Values{}
+			for k, v := range tt.formValues {
+				vals.Set(k, v)
+			}
+			req := httptest.NewRequest("POST", "/oauth2/v2.0/token", strings.NewReader(vals.Encode()))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			w := httptest.NewRecorder()
+
+			handler(w, req)
+
+			if w.Code != tt.expectCode {
+				t.Errorf("Expected status %d, got %d", tt.expectCode, w.Code)
+			}
+			body := w.Body.String()
+			if !strings.Contains(strings.ToLower(body), strings.ToLower(tt.expectErr)) {
+				t.Errorf("Expected error body to contain %q, got: %s", tt.expectErr, body)
 			}
 		})
 	}
